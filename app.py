@@ -1,6 +1,9 @@
 """
-Net Worth Portfolio Tracker
-Streamlit app — yield diinput harian, diakumulasikan otomatis per bulan.
+Net Worth Portfolio Tracker — v4
+- Yield input harian, auto-akumulasi per bulan
+- Form auto-reset setelah submit (no more data overwrite)
+- Auto-advance bulan default ke bulan berikutnya setelah entry terakhir
+- Warning eksplisit kalau mau replace entry yang udah ada
 """
 
 import streamlit as st
@@ -68,7 +71,6 @@ def fmt_short(v):
         return "Rp0"
 
 def days_in(year, month_idx):
-    """Jumlah hari di bulan tertentu (month_idx 0=Jan)."""
     return calendar.monthrange(int(year), int(month_idx) + 1)[1]
 
 def load_data():
@@ -86,7 +88,6 @@ def save_data(data):
         json.dump(data, f, indent=2)
 
 def migrate_entry(e):
-    """Migrate data lama: yields bulanan -> yields_daily harian."""
     if "yields_daily" not in e:
         days = days_in(e["year"], e["month"])
         old_monthly = e.get("yields", {})
@@ -94,7 +95,6 @@ def migrate_entry(e):
     return e
 
 def monthly_yield(e, category_key):
-    """Hitung yield bulanan dari yield harian × jumlah hari di bulan itu."""
     daily = e.get("yields_daily", {}).get(category_key, 0)
     return daily * days_in(e["year"], e["month"])
 
@@ -107,6 +107,20 @@ def entry_timestamp(year, month):
 def sort_entries(entries):
     return sorted(entries, key=lambda e: e["ts"])
 
+def next_month_after_latest(entries):
+    """Cari bulan berikutnya setelah entry terakhir (biar default ga stuck)."""
+    if not entries:
+        now = datetime.now()
+        return now.year, now.month - 1
+    latest = sort_entries(entries)[-1]
+    y, m = latest["year"], latest["month"]
+    # advance 1 month
+    m += 1
+    if m > 11:
+        m = 0
+        y += 1
+    return y, m
+
 # ============================================================
 # INIT STATE
 # ============================================================
@@ -116,6 +130,11 @@ if "edit_idx" not in st.session_state:
     st.session_state.edit_idx = None
 if "page" not in st.session_state:
     st.session_state.page = "📈 Dashboard"
+if "form_iter" not in st.session_state:
+    # Counter buat reset form widgets (tiap submit, incremented)
+    st.session_state.form_iter = 0
+if "flash" not in st.session_state:
+    st.session_state.flash = None  # pesan notifikasi setelah submit
 
 # ============================================================
 # SIDEBAR
@@ -129,6 +148,7 @@ current_idx = PAGES.index(st.session_state.page) if st.session_state.page in PAG
 selected = st.sidebar.radio("Menu", PAGES, index=current_idx, label_visibility="collapsed")
 if selected != st.session_state.page:
     st.session_state.page = selected
+    # Kalau pindah dari halaman input, reset form_iter biar fresh pas balik
     st.rerun()
 
 st.sidebar.markdown("---")
@@ -138,14 +158,16 @@ if st.sidebar.button("🗑️ Reset All Data", use_container_width=True):
     st.session_state.entries = []
     save_data([])
     st.session_state.edit_idx = None
+    st.session_state.form_iter += 1
     st.rerun()
 
 with st.sidebar.expander("💾 Backup / Restore"):
+    st.caption("⚠️ **Streamlit Cloud bisa restart dan menghapus data.** Download backup JSON secara berkala!")
     if st.session_state.entries:
         st.download_button(
             "⬇️ Download JSON",
             data=json.dumps(st.session_state.entries, indent=2),
-            file_name=f"portfolio_{datetime.now().strftime('%Y%m%d')}.json",
+            file_name=f"portfolio_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
             mime="application/json",
             use_container_width=True,
         )
@@ -164,7 +186,19 @@ with st.sidebar.expander("💾 Backup / Restore"):
 # DASHBOARD
 # ============================================================
 def render_dashboard():
-    st.title("Dashboard")
+    st.title("📈 Dashboard")
+
+    # Flash message (dari form submit)
+    if st.session_state.flash:
+        msg, level = st.session_state.flash
+        if level == "success":
+            st.success(msg)
+        elif level == "warning":
+            st.warning(msg)
+        else:
+            st.info(msg)
+        st.session_state.flash = None
+
     entries = sort_entries(st.session_state.entries)
 
     if not entries:
@@ -181,7 +215,6 @@ def render_dashboard():
     latest_days = days_in(latest["year"], latest["month"])
     latest_daily_yield = latest_monthly_yield / latest_days if latest_days else 0
 
-    # Top metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total Net Worth", fmt_rp(latest["total"]), help=f"Data per {latest['label']}")
@@ -208,7 +241,6 @@ def render_dashboard():
 
     st.markdown("---")
 
-    # Chart data
     df = pd.DataFrame([
         {"bulan": e["label"],
          "Net Worth": e["total"],
@@ -217,7 +249,6 @@ def render_dashboard():
         for e in entries
     ])
 
-    # Main chart
     st.subheader("Net Worth & Passive Income")
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(
@@ -243,7 +274,6 @@ def render_dashboard():
     fig.update_xaxes(gridcolor="#1e293b")
     st.plotly_chart(fig, use_container_width=True)
 
-    # MoM Change
     if len(entries) > 1:
         st.subheader("Perubahan Bulanan (%)")
         changes = []
@@ -269,7 +299,6 @@ def render_dashboard():
         fig.update_xaxes(gridcolor="#1e293b")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Allocation + Yield
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Alokasi Aset")
@@ -319,7 +348,6 @@ def render_dashboard():
         else:
             st.info("Belum ada yield.")
 
-    # Stacked composition
     if len(entries) > 1:
         st.subheader("Komposisi Aset Over Time")
         fig = go.Figure()
@@ -343,12 +371,13 @@ def render_dashboard():
 
 
 # ============================================================
-# INPUT
+# INPUT (FIXED)
 # ============================================================
 def render_input():
     is_edit = st.session_state.edit_idx is not None
     st.title("✏️ Edit Data" if is_edit else "➕ Tambah Data Bulanan")
 
+    # Tentukan default values
     if is_edit:
         edit_entry = st.session_state.entries[st.session_state.edit_idx]
         default_year = edit_entry["year"]
@@ -357,32 +386,60 @@ def render_input():
         default_values = {c["key"]: edit_entry["values"].get(c["key"], 0) for c in CATEGORIES}
         default_daily = {c["key"]: edit_entry.get("yields_daily", {}).get(c["key"], 0) for c in CATEGORIES}
     else:
-        now = datetime.now()
-        default_year = now.year
-        default_month = now.month - 1
+        # Auto-advance: default ke bulan setelah entry terakhir
+        default_year, default_month = next_month_after_latest(st.session_state.entries)
         default_desc = ""
         default_values = {c["key"]: 0 for c in CATEGORIES}
         default_daily = {c["key"]: 0 for c in CATEGORIES}
 
-    # Year & month PICKERS OUTSIDE form biar days_in_month live-update
+    # Key suffix buat reset widget tiap form_iter berubah
+    # + tambah "edit_<idx>" buat bedakan state edit vs new
+    s = st.session_state.form_iter
+    mode_tag = f"edit_{st.session_state.edit_idx}" if is_edit else "new"
+    key_suffix = f"{s}_{mode_tag}"
+
+    # Year/Month OUTSIDE form buat live days-in-month
     col1, col2 = st.columns(2)
     with col1:
-        year = st.number_input("Tahun", min_value=2000, max_value=2100,
-                               value=default_year, step=1, key="input_year")
+        year = st.number_input(
+            "Tahun", min_value=2000, max_value=2100,
+            value=default_year, step=1,
+            key=f"yr_{key_suffix}",
+        )
     with col2:
-        month = st.selectbox("Bulan", options=list(range(12)),
-                             format_func=lambda x: MONTHS[x], index=default_month,
-                             key="input_month")
+        month = st.selectbox(
+            "Bulan", options=list(range(12)),
+            format_func=lambda x: MONTHS[x], index=default_month,
+            key=f"mo_{key_suffix}",
+        )
 
     days = days_in(year, month)
-    st.info(f"📅 **{MONTHS[month]} {year}** punya **{days} hari** — yield harian akan dikali {days} untuk total bulan ini.")
 
-    with st.form("input_form", clear_on_submit=False):
+    # Check if period already exists (WARNING biar ga accidentally overwrite)
+    dup_idx = None
+    for i, e in enumerate(st.session_state.entries):
+        if e["year"] == year and e["month"] == month:
+            if not is_edit or i != st.session_state.edit_idx:
+                dup_idx = i
+                break
+
+    if dup_idx is not None and not is_edit:
+        st.warning(
+            f"⚠️ **Data untuk {MONTHS[month]} {year} sudah ada!** "
+            f"Kalau kamu submit sekarang, data lama akan **ditimpa**. "
+            f"Ganti bulan/tahun kalau mau nambah data baru."
+        )
+    else:
+        st.info(f"📅 **{MONTHS[month]} {year}** punya **{days} hari** — yield harian akan dikali {days} untuk total bulan ini.")
+
+    # Form
+    with st.form(f"input_form_{key_suffix}", clear_on_submit=False):
         description = st.text_area(
             "📝 Deskripsi / Catatan",
             value=default_desc,
-            placeholder="Contoh: Bulan ini dapat dividen BBCA, top up crypto, staking USDT di exchange...",
+            placeholder="Contoh: Bulan ini dapat dividen BBCA, top up crypto, staking USDT...",
             height=80,
+            key=f"desc_{key_suffix}",
         )
 
         st.markdown("##### Detail Aset & Yield Harian")
@@ -404,14 +461,14 @@ def render_input():
                     "Nilai Aset (Rp)",
                     min_value=0.0, value=float(default_values[c["key"]]),
                     step=1_000_000.0, format="%.0f",
-                    key=f"val_{c['key']}",
+                    key=f"val_{c['key']}_{key_suffix}",
                 )
             with cols[2]:
                 daily_yields[c["key"]] = st.number_input(
                     f"{c['yield_label']} / hari (Rp)",
                     min_value=0.0, value=float(default_daily[c["key"]]),
                     step=10_000.0, format="%.0f",
-                    key=f"dly_{c['key']}",
+                    key=f"dly_{c['key']}_{key_suffix}",
                 )
             with cols[3]:
                 monthly = daily_yields[c["key"]] * days
@@ -440,15 +497,14 @@ def render_input():
 
         col1, col2, _ = st.columns([1, 1, 2])
         with col1:
-            submit = st.form_submit_button(
-                "💾 Simpan & Lihat Dashboard" if not is_edit else "✅ Update & Lihat Dashboard",
-                use_container_width=True, type="primary",
-            )
+            submit_label = "💾 Simpan & Lihat Dashboard" if not is_edit else "✅ Update"
+            submit = st.form_submit_button(submit_label, use_container_width=True, type="primary")
         with col2:
-            cancel = st.form_submit_button("❌ Batal", use_container_width=True) if is_edit else False
+            cancel = st.form_submit_button("❌ Batal", use_container_width=True)
 
         if cancel:
             st.session_state.edit_idx = None
+            st.session_state.form_iter += 1  # reset form widgets
             st.session_state.page = "📈 Dashboard"
             st.rerun()
 
@@ -463,10 +519,16 @@ def render_input():
                 "yields_daily": {k: float(v) for k, v in daily_yields.items()},
                 "total": float(total_asset),
             }
+
+            action = "ditambahkan"
+
             if is_edit:
+                # Editing existing entry
                 st.session_state.entries[st.session_state.edit_idx] = entry
+                action = "diupdate"
                 st.session_state.edit_idx = None
             else:
+                # Check for same-period duplicate
                 existing_idx = None
                 for i, e in enumerate(st.session_state.entries):
                     if e["year"] == entry["year"] and e["month"] == entry["month"]:
@@ -474,13 +536,25 @@ def render_input():
                         break
                 if existing_idx is not None:
                     st.session_state.entries[existing_idx] = entry
+                    action = "ditimpa (replace data lama)"
                 else:
                     st.session_state.entries.append(entry)
 
             st.session_state.entries = sort_entries(st.session_state.entries)
             save_data(st.session_state.entries)
+
+            # Reset form widgets
+            st.session_state.form_iter += 1
+
+            # Flash message + redirect
+            flash_level = "warning" if "ditimpa" in action else "success"
+            st.session_state.flash = (
+                f"✅ Data **{entry['label']}** berhasil **{action}**. "
+                f"Total aset: {fmt_rp(total_asset)} · Yield bulan ini: {fmt_rp(total_monthly_yld)} "
+                f"({days} hari × {fmt_rp(total_daily_yield)}/hari)",
+                flash_level,
+            )
             st.session_state.page = "📈 Dashboard"
-            st.toast(f"✅ Data {entry['label']} berhasil disimpan!", icon="🎉")
             st.rerun()
 
 
@@ -494,6 +568,8 @@ def render_history():
     if not entries:
         st.info("Belum ada data.")
         return
+
+    st.caption(f"Total **{len(entries)}** entry tersimpan.")
 
     for i, e in enumerate(entries):
         prev_t = entries[i-1]["total"] if i > 0 else None
@@ -517,6 +593,7 @@ def render_history():
                 real_idx = st.session_state.entries.index(e)
                 if st.button("✏️ Edit", key=f"edit_{i}", use_container_width=True):
                     st.session_state.edit_idx = real_idx
+                    st.session_state.form_iter += 1
                     st.session_state.page = "➕ Tambah / Edit Data"
                     st.rerun()
                 if st.button("🗑️ Hapus", key=f"del_{i}", use_container_width=True):
@@ -607,7 +684,6 @@ def render_analysis():
 
     st.markdown("---")
 
-    # Passive income trend
     st.subheader("Trend Passive Income Bulanan")
     df_pi = pd.DataFrame([{
         "bulan": e["label"],
@@ -632,7 +708,6 @@ def render_analysis():
     fig.update_xaxes(gridcolor="#1e293b")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Per category detail
     st.subheader("Detail per Kategori (Latest vs Previous)")
     latest_days = days_in(latest["year"], latest["month"])
     cat_cols = st.columns(4)
@@ -662,7 +737,6 @@ def render_analysis():
                 st.markdown(f"<small style='color:#64748b;'>Alokasi: {alloc:.1f}%</small>", unsafe_allow_html=True)
         shown += 1
 
-    # Diversification
     st.markdown("---")
     st.subheader("Skor Diversifikasi")
     alloc_values = [latest["values"].get(c["key"], 0) for c in CATEGORIES]
@@ -689,7 +763,6 @@ def render_analysis():
             if score <= 40:
                 st.info("💡 Pertimbangkan untuk mendiversifikasi ke lebih banyak kelas aset.")
 
-    # Export
     st.markdown("---")
     df_export = pd.DataFrame([
         {"Periode": e["label"],
@@ -705,7 +778,6 @@ def render_analysis():
         "📊 Download data sebagai CSV",
         data=df_export.to_csv(index=False).encode("utf-8"),
         file_name=f"portfolio_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
     )
 
 
@@ -722,4 +794,4 @@ elif st.session_state.page == "🔍 Analisis":
     render_analysis()
 
 st.sidebar.markdown("---")
-st.sidebar.caption("💡 Data disimpan otomatis di `portfolio_data.json`")
+st.sidebar.caption("💡 Jangan lupa backup JSON secara berkala!")
